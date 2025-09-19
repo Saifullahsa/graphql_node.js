@@ -182,13 +182,13 @@ async function start() {
     console.log(`Subscriptions ready at ws://localhost:${PORT}/graphql`);
   });
 
-  const shutdown = async () => {
-    await serverCleanup.dispose();
-    await apolloServer.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // const shutdown = async () => {
+  //   await serverCleanup.dispose();
+  //   await apolloServer.stop();
+  //   process.exit(0);
+  // };
+  // process.on("SIGINT", shutdown);
+  // process.on("SIGTERM", shutdown);
 }
 
 start().catch(err => {
