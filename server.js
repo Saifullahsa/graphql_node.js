@@ -32,6 +32,8 @@ const pool = new Pool({
 
 const pubsub = new PubSub();
 const MESSAGE_TOPIC = "MESSAGE_POSTED";
+const MESSAGE_UPDATE = "MESSAGE_UPDATE";
+const MESSAGE_DELETE = "MESSAGE_DELETE";
 
 const typeDefs = `#graphql
 type Message {
@@ -41,16 +43,25 @@ type Message {
   createdAt: String!
 }
 
+type DeletedMessage {
+  id: ID!
+  success: Boolean!
+}
+
 type Query {
   messages: [Message!]!
 }
 
 type Mutation {
   postMessage(user: String!, text: String!): Message!
+  updateMessage(id: ID!, text: String!): Message!
+  deleteMessage(id: ID!): DeletedMessage!
 }
 
 type Subscription {
   messagePosted: Message!
+  messageUpdated: Message!
+  messageDeleted: DeletedMessage!
 }
 `;
 
@@ -88,11 +99,50 @@ const resolvers = {
       await pubsub.publish(MESSAGE_TOPIC, { messagePosted: message });
       return message;
     },
+    
+    updateMessage: async (_, { id, text }) => {
+      const res = await pool.query(
+        `UPDATE messages SET text=$1 WHERE id=$2
+         RETURNING id, user_name AS user, text, created_at`,
+        [text, id]
+      );
+      const row = res.rows[0];
+      if (!row) throw new Error("Message not found");
+      const message = {
+        id: row.id,
+        user: row.user,
+        text: row.text,
+        createdAt: row.created_at.toISOString(),
+      };
+      await pubsub.publish(MESSAGE_UPDATE, { messageUpdated: message });
+      return message;
+    },
+
+    deleteMessage: async (_, { id }) => {
+      const res = await pool.query(`DELETE FROM messages WHERE id=$1`, [id]);
+      const success = res.rowCount > 0;
+      const deletedMessage = {
+        id,
+        success
+      };
+      
+      if (success) {
+        await pubsub.publish(MESSAGE_DELETE, { messageDeleted: deletedMessage });
+      }
+      
+      return deletedMessage;
+    },
   },
 
   Subscription: {
     messagePosted: {
       subscribe: () => pubsub.asyncIterableIterator(MESSAGE_TOPIC),
+    },
+    messageUpdated: {
+      subscribe: () => pubsub.asyncIterableIterator(MESSAGE_UPDATE),
+    },
+    messageDeleted: {
+      subscribe: () => pubsub.asyncIterableIterator(MESSAGE_DELETE),
     },
   },
 };
@@ -108,13 +158,12 @@ async function start() {
   app.use(express.json());
 
   app.use(
-  "/graphql",
-  express.json(),         
-  expressMiddleware(apolloServer, {
-    context: async ({ req }) => ({ pool, pubsub }),
-  })
-);
-
+    "/graphql",
+    express.json(),         
+    expressMiddleware(apolloServer, {
+      context: async ({ req }) => ({ pool, pubsub }),
+    })
+  );
 
   const httpServer = http.createServer(app);
 

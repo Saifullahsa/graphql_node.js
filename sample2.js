@@ -1,93 +1,178 @@
-import { ApolloServer } from "@apollo/server";
-import { startStandaloneServer } from "@apollo/server/standalone";
-import pkg from "pg";
+import express from "express";
+import http from "http";
+import cors from "cors";
 import dotenv from "dotenv";
+import bodyParser from "body-parser";
 
 dotenv.config();
+
+import { ApolloServer } from "@apollo/server"; 
+import { expressMiddleware } from "@apollo/server/express4"; 
+import { makeExecutableSchema } from "@graphql-tools/schema";
+
+import { PubSub } from "graphql-subscriptions";
+import pkg from "pg";
 const { Pool } = pkg;
 
+import { WebSocketServer } from "ws";
+import { useServer } from "graphql-ws/lib/use/ws"; 
+
+const PORT = process.env.PORT || 4000;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error("Please set DATABASE_URL in .env");
+  process.exit(1);
+}
+
 const pool = new Pool({
-  host: process.env.PGHOST,
-  port: process.env.PGPORT,
-  user: process.env.PGUSER,
-  password: process.env.PGPASSWORD,
-  database: process.env.PGDATABASE,
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
+const pubsub = new PubSub();
+const MESSAGE_TOPIC = "MESSAGE_POSTED";
+const MESSAGE_UPDATE = "MESSAGE_UPDATE";
+const MESSAGE_DELETE = "MESSAGE_DELETE"
+
 const typeDefs = `#graphql
-  type Film {
-    film_id: ID!
-    title: String!
-    film_category: [Film_category!]!
-  }
+type Message {
+  id: ID!
+  user: String!
+  text: String!
+  createdAt: String!
+}
 
-  type Film_category {
-    film_id: ID!
-    category_id: ID!
-    category: Category!
-  }
+type Query {
+  messages: [Message!]!
+}
 
-  type Category {
-    category_id: ID!
-    name: String!
-  }
+type Mutation {
+  postMessage(user: String!, text: String!): Message!
+  updateMessage(id: ID!, text: String!): Message!
+  deleteMessage(id: ID!): Boolean!
+}
 
-  type Query {
-    films: [Film!]!
-    film_categorys: [Film_category!]!
-    categorys: [Category!]!
-    filmsByCategory(category: String!): [Film!]!
-  }
+type Subscription {
+  messagePosted: Message!
+  Messageupdated: Message!
+  Messagedeleteed: Boolean!
+}
 `;
 
 const resolvers = {
   Query: {
-    films: async () => {
-      const { rows } = await pool.query("SELECT * FROM film");
-      return rows;
-    },
-    film_categorys: async () => {
-      const { rows } = await pool.query("SELECT * FROM film_category");
-      return rows;
-    },
-    categorys: async () => {
-      const { rows } = await pool.query("SELECT * FROM category");
-      return rows;
-    },
-    filmsByCategory: async (_, { category }) => {
-      const { rows: films } = await pool.query("SELECT * FROM film");
-      const { rows: filmCategories } = await pool.query("SELECT * FROM film_category");
-      const { rows: categories } = await pool.query("SELECT * FROM category");
-
-      const cat = categories.find((c) => c.name === category);
-      if (!cat) return [];
-
-      const filmIds = filmCategories.filter((fc) => fc.category_id === cat.category_id)
-        .map((fc) => fc.film_id);
-
-      return films.filter((f) => filmIds.includes(f.film_id));
+    messages: async () => {
+      const res = await pool.query(
+        `SELECT id, user_name AS user, text, created_at
+         FROM messages ORDER BY created_at ASC`
+      );
+      return res.rows.map(r => ({
+        id: r.id,
+        user: r.user,
+        text: r.text,
+        createdAt: r.created_at.toISOString(),
+      }));
     },
   },
 
-  Film: {
-    film_category: async (film) => {
-      const { rows } = await pool.query("SELECT * FROM film_category");
-      return rows.filter((fc) => fc.film_id === film.film_id);
+  Mutation: {
+    postMessage: async (_, { user, text }) => {
+      const res = await pool.query(
+        `INSERT INTO messages (user_name, text)
+         VALUES ($1, $2)
+         RETURNING id, user_name AS user, text, created_at`,
+        [user, text]
+      );
+      const row = res.rows[0];
+      const message = {
+        id: row.id,
+        user: row.user,
+        text: row.text,
+        createdAt: row.created_at.toISOString(),
+      };
+      await pubsub.publish(MESSAGE_TOPIC, { messagePosted: message });
+      return message;
     },
+    updateMessage: async (_, { id, text }) => {
+  const res = await pool.query(
+    `UPDATE messages SET text=$1 WHERE id=$2
+     RETURNING id, user_name AS user, text, created_at`,
+    [text, id]
+  );
+  const row = res.rows[0];
+  if (!row) throw new Error("Message not found");
+  const message = {
+    id: row.id,
+    user: row.user,
+    text: row.text,
+    createdAt: row.created_at.toISOString(),
+  };
+  return message;
+},
+
+deleteMessage: async (_, { id }) => {
+  const res = await pool.query(`DELETE FROM messages WHERE id=$1`, [id]);
+  return res.rowCount > 0;
+},
+
   },
 
-  Film_category: {
-    category: async (fc) => {
-      const { rows } = await pool.query("SELECT * FROM category");
-      return rows.find((c) => c.category_id === fc.category_id);
+  Subscription: {
+    messagePosted: {
+      subscribe: () => pubsub.asyncIterableIterator(MESSAGE_TOPIC),
     },
+      Messageupdated: {
+        subscribe:() => pubsub.asyncIterableIterator()
+      }
   },
 };
 
-const server = new ApolloServer({ typeDefs, resolvers });
+async function start() {
+  const schema = makeExecutableSchema({ typeDefs, resolvers });
 
-const { url } = await startStandaloneServer(server, {
-  listen: { port: 4000 },
+  const apolloServer = new ApolloServer({ schema });
+  await apolloServer.start();
+
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+
+  app.use(
+  "/graphql",
+  express.json(),         
+  expressMiddleware(apolloServer, {
+    context: async ({ req }) => ({ pool, pubsub }),
+  })
+);
+
+
+  const httpServer = http.createServer(app);
+
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    path: "/graphql",
+  });
+
+  const serverCleanup = useServer(
+    { schema, context: async () => ({ pool, pubsub }) },
+    wsServer
+  );
+
+  httpServer.listen(PORT, () => {
+    console.log(`Server ready at http://localhost:${PORT}/graphql`);
+    console.log(`Subscriptions ready at ws://localhost:${PORT}/graphql`);
+  });
+
+  const shutdown = async () => {
+    await serverCleanup.dispose();
+    await apolloServer.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+start().catch(err => {
+  console.error("Server failed to start:", err);
 });
-
-console.log(` Server ready at ${url}`);
